@@ -1,0 +1,18 @@
+# 强化学习训练所需的依赖包
+
+# 核心强化学习库
+gymnasium>=0.29.0
+stable-baselines3>=2.0.0
+
+# 深度学习框架
+# torch>=2.0.0
+
+# 可视化和监控
+tensorboard>=2.13.0
+
+# 其他工具
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# 注意: Isaac Sim相关的依赖已经包含在Isaac Sim安装中
+# isaacsim 相关库不需要单独安装
