@@ -15,7 +15,7 @@
 训练一个新的PPO模型：
 
 ```powershell
-python rl_all_in_one.py train --algorithm ppo --timesteps 100000
+C:\issac-sim\python.bat rl_all_in_one.py train --algorithm ppo --timesteps 100000
 ```
 
 **参数说明:**
@@ -31,10 +31,10 @@ python rl_all_in_one.py train --algorithm ppo --timesteps 100000
 python rl_all_in_one.py train --algorithm ppo --timesteps 50000 --headless
 
 # 复杂任务（10个方块，20万步）
-python rl_all_in_one.py train --algorithm ppo --timesteps 200000 --cube-num 10
+C:\issac-sim\python.bat rl_all_in_one.py train --algorithm ppo --timesteps 100000 --headless --cube-num 1
 
 # 使用SAC算法
-python rl_all_in_one.py train --algorithm sac --timesteps 100000 --headless
+C:\issac-sim\python.bat rl_all_in_one.py train --algorithm ppo --timesteps 100000 --headless
 ```
 
 **训练后文件:**
@@ -55,7 +55,7 @@ tensorboard --logdir ./logs/
 测试训练好的模型性能：
 
 ```powershell
-python rl_all_in_one.py test --model ./models/ppo_armpickplace_final.zip --episodes 5
+C:\issac-sim\python.bat rl_all_in_one.py test --model .\models\ppo_armpickplace_final.zip --episodes 5
 ```
 
 **参数说明:**

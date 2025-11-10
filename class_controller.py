@@ -106,44 +106,46 @@ class RLController(BaseController):
         target_joint_positions = np.clip(target_joint_positions, joint_limits_lower, joint_limits_upper)
         
         return ArticulationAction(joint_positions=target_joint_positions)
-    
+    # class_controller.py -> RLController._dict_to_array()
+
     def _dict_to_array(self, observations: dict) -> np.ndarray:
         """
         将观测字典转换为扁平化的numpy数组
-        
-        观测格式应该与rl_environment.py中的_get_obs()一致:
-        [ee_pos(3), joint_pos(9), cube_pos(3), cube_color(1), target_pos(3), gripper_state(1)]
+        *** 必须与 rl_environment.py 中的 _get_obs() 完全一致 ***
         """
         # 提取机器人观测
         robot_obs = observations[self._articulation.name]
-        ee_position = robot_obs["end_effector_position"][0]  # 提取位置部分
+        ee_position = robot_obs["end_effector_position"]
         joint_positions = robot_obs["joint_positions"]
         
-        # 提取当前目标方块信息（这里简化处理，假设有current_cube_name）
-        # 实际使用时需要根据具体情况调整
-        if "current_cube_position" in observations:
-            cube_position = observations["current_cube_position"]
-            cube_color_idx = observations["current_cube_color"]
-            target_position = observations["current_target_position"]
-            gripper_state = observations.get("gripper_state", np.array([0.0]))
+        # 提取当前目标方块和目标位置信息
+        cube_position = observations.get("current_cube_position", np.zeros(3))
+        target_position = observations.get("current_target_position", np.zeros(3))
+        has_grasped = observations.get("gripper_state", 0.0) # 0.0 for open, 1.0 for grasped
+
+        # 关键：完全复制训练环境中的相对向量计算逻辑
+        if not has_grasped:
+            relative_vec = cube_position - ee_position
         else:
-            # 如果没有提供，使用零值
-            cube_position = np.zeros(3)
-            cube_color_idx = 0
-            target_position = np.zeros(3)
-            gripper_state = np.array([0.0])
+            relative_vec = target_position - cube_position
         
-        # 组合观测
+        distance = np.linalg.norm(relative_vec)
+        
+        gripper_state_array = np.array([has_grasped])
+
+        # 组合观测，顺序和维度必须与训练时完全一致
         obs_array = np.concatenate([
-            ee_position.astype(np.float32),
-            joint_positions.astype(np.float32),
-            cube_position.astype(np.float32),
-            np.array([cube_color_idx], dtype=np.float32),
-            target_position.astype(np.float32),
-            np.array([gripper_state], dtype=np.float32)
-        ])
+            ee_position.astype(np.float32),              # 3
+            joint_positions.astype(np.float32),            # 9 (7 arm + 2 gripper)
+            relative_vec.astype(np.float32),         # 3
+            np.array([distance], dtype=np.float32), # 1
+            cube_position.astype(np.float32),             # 3
+            target_position.astype(np.float32),           # 3
+            gripper_state_array.astype(np.float32)       # 1
+        ]) # Total: 3+9+3+1+3+3+1 = 23
         
         return obs_array
+
     
     def reset(self):
         """重置控制器状态"""

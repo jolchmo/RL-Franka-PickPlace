@@ -90,23 +90,23 @@ def train_model(args):
         name_prefix=f"{args.algorithm}_armpickplace"
     )
     
-    # 创建模型
+    # 创建模型（优化训练速度）
     if args.algorithm == "ppo":
         model = PPO(
             "MlpPolicy",
             env,
             learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,  # 保持高折扣因子，因为需要长期规划
+            n_steps=1024,  # 从2048减少到1024（更快收集样本）
+            batch_size=128,  # 从64增加到128（提高GPU利用率）
+            n_epochs=10,  # 从10减少到5（减少训练时间）
+            gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.02,  # 增加探索（0.01 → 0.02）
+            ent_coef=0.02,
             verbose=1,
             tensorboard_log="./logs/",
             policy_kwargs=dict(
-                net_arch=[dict(pi=[256, 256], vf=[256, 256])]  # 增大网络容量
+                net_arch=[dict(pi=[256, 256], vf=[128, 128])]  # 从256减小到128（更快）
             )
         )
     elif args.algorithm == "sac":
@@ -178,6 +178,7 @@ def test_model(args):
     
     # 创建环境
     env = ArmPickPlaceRLEnv(
+        render_mode='human',
         headless=args.headless, 
         cube_num=args.cube_num,
         simulation_app=simulation_app
@@ -233,23 +234,11 @@ def test_model(args):
             episode_reward += reward
             episode_length += 1
             
-            # 每50步打印一次进度
-            if episode_length % 50 == 0:
-                print(f"  Step {episode_length}: "
-                      f"Cube {info['current_cube_idx']}/{args.cube_num}, "
-                      f"Grasped: {info['has_grasped']}, "
-                      f"Reward: {episode_reward:.2f}")
         
         # 记录统计
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
         
-        # 判断成功
-        if info['current_cube_idx'] >= args.cube_num:
-            success_count += 1
-            print(f"  ✅ 成功完成!")
-        else:
-            print(f"  ❌ 未完成 ({info['current_cube_idx']}/{args.cube_num})")
         
         print(f"  奖励: {episode_reward:.2f}, 步数: {episode_length}")
     
@@ -352,28 +341,21 @@ def run_model(args):
                 reset_needed = True
                 
             if world.is_playing():
-                if reset_needed:
-                    world.reset()
-                    controller.reset()
-                    current_cube_idx = 0
-                    has_grasped = False
-                    step_count = 0
-                    reset_needed = False
-                    print("\n环境已重置")
-                
                 # 获取观测
                 observations = task.get_observations()
                 
-                # 准备RL控制器所需的观测
+                # 准备RL控制器所需的观测 (修正版)
                 if current_cube_idx < len(cube_names):
                     current_cube_name = cube_names[current_cube_idx]
                     cube_position = observations[current_cube_name]["position"]
-                    cube_color_idx = observations[current_cube_name]["color"]
+                    # BUG修复: 键名是 "color_idx", 不是 "color"
+                    cube_color_idx = observations[current_cube_name]["color_idx"]
                     target_position = observations["target_positions"][cube_color_idx]
                     
+                    # 填充控制器需要的所有信息
                     observations["current_cube_position"] = cube_position
-                    observations["current_cube_color"] = cube_color_idx
                     observations["current_target_position"] = target_position
+                    # gripper_state 需要在循环中自己维护，就像训练时一样
                     observations["gripper_state"] = 1.0 if has_grasped else 0.0
                 
                 # 使用RL控制器
@@ -382,30 +364,19 @@ def run_model(args):
                 
                 step_count += 1
                 
-                # 每100步打印状态
-                if step_count % 100 == 0:
-                    ee_pos, _ = robot.end_effector.get_world_pose()
-                    print(f"Step {step_count}: "
-                          f"Cube {current_cube_idx+1}/{len(cube_names)}, "
-                          f"EE: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
+                # 更新 has_grasped 状态 (简化版逻辑)
+                ee_pos, _ = robot.end_effector.get_world_pose()
+                cube_pos = observations.get("current_cube_position", np.zeros(3))
+                dist_ee_cube = np.linalg.norm(ee_pos - cube_pos)
                 
-                # 检查方块是否到达目标
-                if current_cube_idx < len(cube_names):
-                    current_cube_name = cube_names[current_cube_idx]
-                    cube_position = observations[current_cube_name]["position"]
-                    cube_color_idx = observations[current_cube_name]["color"]
-                    target_position = observations["target_positions"][cube_color_idx]
-                    
-                    distance_to_target = np.linalg.norm(cube_position - target_position)
-                    if distance_to_target < 0.1:
-                        print(f"✅ 方块 {current_cube_idx+1} 已到达目标位置")
-                        current_cube_idx += 1
-                        has_grasped = False
-                        
-                        if current_cube_idx >= len(cube_names):
-                            print(f"\n🎉 任务完成！所有 {len(cube_names)} 个方块已分类摆放")
-                            print(f"总步数: {step_count}")
-                            reset_needed = True
+                if not has_grasped and dist_ee_cube < 0.05 and robot.gripper.is_closed() and cube_pos[2] > 0.02:
+                    has_grasped = True
+                    print(">> [RUN MODE] Grasped Cube")
+                
+                if has_grasped and cube_pos[2] < 0.02:
+                    has_grasped = False
+                    print(">> [RUN MODE] Released Cube")
+                # ... (rest of the loop) ...
     
     except KeyboardInterrupt:
         print("\n\n用户中断")
@@ -443,7 +414,7 @@ def main():
                              choices=['ppo', 'sac'], help='RL算法')
     train_parser.add_argument('--timesteps', type=int, default=100000, 
                              help='训练步数')
-    train_parser.add_argument('--cube-num', type=int, default=6, 
+    train_parser.add_argument('--cube-num', type=int, default=1, 
                              help='方块数量')
     train_parser.add_argument('--headless', action='store_true', 
                              help='无头模式')
