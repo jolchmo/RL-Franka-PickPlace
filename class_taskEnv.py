@@ -50,10 +50,11 @@ class taskEnv_SceneSetup(BaseTask):
             self._cube_scale = cube_scale
 
         # 目标位置和颜色定义 (单位: 米)
+        # 🎯 优化目标位置: 确保在Franka机器人可达范围内
         self._target_positions_meters = np.array([
-            [0.4, 0.3, 0.0],   # Red
-            [0.4, 0.0, 0.0],   # Green
-            [0.4, -0.3, 0.0]   # Blue
+            [0.5, 0.2, 0.0],   # Red - 从[0.4, 0.3]改为[0.5, 0.2]
+            [0.5, 0.0, 0.0],   # Green - 保持中间位置
+            [0.5, -0.2, 0.0]   # Blue - 从[0.4, -0.3]改为[0.5, -0.2]
         ])
         self._target_colors = np.array([
             [1.0, 0.0, 0.0],  # Red
@@ -102,15 +103,16 @@ class taskEnv_SceneSetup(BaseTask):
     def _get_random_cube_pose(self):
         # 在一个固定区域内随机生成方块位置
         # 位置单位: 场景单位
-        x = np.random.uniform(0.1, 0.3) / self._stage_units
-        y = np.random.uniform(-0.3, 0.3) / self._stage_units
+        # 🎯 优化工作空间: 确保方块位置在Franka机器人可达范围内
+        x = np.random.uniform(0.3, 0.5) / self._stage_units  # 从0.1~0.3改为0.3~0.5 (更合理的前方距离)
+        y = np.random.uniform(-0.2, 0.2) / self._stage_units  # 从-0.3~0.3改为-0.2~0.2 (避免极限左右位置)
         z = (self._cube_scale[2] / 2.0) / self._stage_units
         position = np.array([x, y, z])
 
         # 检查重叠
         while any(np.linalg.norm(position - p) < self._cube_scale[0] * 2 / self._stage_units for p in self._cube_positions):
-            x = np.random.uniform(0.1, 0.3) / self._stage_units
-            y = np.random.uniform(-0.3, 0.3) / self._stage_units
+            x = np.random.uniform(0.3, 0.5) / self._stage_units
+            y = np.random.uniform(-0.2, 0.2) / self._stage_units
             position = np.array([x, y, z])
 
         self._cube_positions.append(position)
@@ -177,13 +179,7 @@ class taskEnv_SceneSetup(BaseTask):
         self._cube_colors_idx = []
         super().cleanup()
 
-# class_taskEnv.py
-# ... (保留文件顶部的其他import) ...
-# 注意：我们不再需要 IKSolver 或任何 Omnigraph 的东西了
-# ... (保留 taskEnv_SceneSetup 类的定义) ...
-# ==============================================================================
-#  ↓↓↓ 将下面这个完整的类替换掉您文件中旧的 ArmPickPlaceRLEnv 类 ↓↓↓
-# ==============================================================================
+
 class ArmPickPlaceRLEnv(gym.Env):
     """
     【关节空间控制版】
@@ -191,7 +187,7 @@ class ArmPickPlaceRLEnv(gym.Env):
     这种方式更底层、更直接，但对 Agent 的学习能力要求更高。
     """
     metadata = {"render_modes": ["human", "rgb_array"]}
-    def __init__(self, headless=False, render_mode=None, max_episode_steps=750, cube_num=8, simulation_app=None):
+    def __init__(self, headless=False, render_mode=None, max_episode_steps=1200   , cube_num=8, simulation_app=None):
         if not GYMNASIUM_AVAILABLE:
             raise ImportError("gymnasium is required. Please run: pip install gymnasium")
         super().__init__()
@@ -217,13 +213,12 @@ class ArmPickPlaceRLEnv(gym.Env):
         self.robot = self.world.scene.get_object(self.robot_name)
         self.articulation_controller = self.robot.get_articulation_controller()
         
-        # 【核心修改 1】: 定义关节空间下的动作空间
-        # Franka 有7个臂部关节 + 1个用于控制夹爪开合的动作
+
         num_arm_joints = 7
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(num_arm_joints + 1,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(num_arm_joints,), dtype=np.float32)
         
         # 观测空间保持不变，因为它已经包含了关节位置和任务所需信息
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(23,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(18,), dtype=np.float32)
         # 任务相关的逻辑状态变量
         self.current_step = 0
         self.cube_names = []
@@ -233,48 +228,41 @@ class ArmPickPlaceRLEnv(gym.Env):
         self.last_distance_to_target = None
     def step(self, action: np.ndarray):
         """
-        【关节空间控制版】的 step 函数
+        【关节空间控制版 + 三态夹爪】的 step 函数
+        action[0:7]: 关节增量
+        action[7]: 夹爪控制 (< -0.33=打开, 中间=不动, > 0.33=关闭)
         """
         self.current_step += 1
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        # 【核心修改 2】: 将动作解析为关节指令
         
-        # 1. 提取关节动作和夹爪动作
-        # 前7个值用于控制7个臂部关节
         joint_actions = action[:7]
-        # 最后1个值用于控制夹爪
-        gripper_action = action[7]
-        # 2. 计算目标关节位置（增量式控制）
-        # 这是标准的做法：Agent输出的是一个小的“变化量”，而不是绝对位置
-        action_scale = 0.05  # 每个step关节角度的最大变化量（单位：弧度）
+
+        action_scale = 0.4
         
         # 获取当前所有关节的位置（Franka有9个自由度：7臂+2指）
         current_joint_positions = self.robot.get_joint_positions()
         
-        # 只修改臂部关节（前7个）
-        # 创建一个新的目标位置数组，防止修改原始数据
+        # 应用关节动作
         target_joint_positions = np.copy(current_joint_positions)
         target_joint_positions[:7] += joint_actions * action_scale
         
-        # 3. 应用关节动作
-        # ArticulationAction可以直接接收关节位置指令
         robot_action = ArticulationAction(joint_positions=target_joint_positions)
         self.articulation_controller.apply_action(robot_action)
-        # 4. 夹爪控制逻辑保持不变
-        if gripper_action > 0.5:
-            self.robot.gripper.close()
-        elif gripper_action < -0.5:
-            self.robot.gripper.open()
-        # 推进仿真并获取结果
-        if self.render_mode == "haman":
+
+
+        if self.render_mode == "human":
             self.world.step(render=True)
         else:
             self.world.step(render=False)
+            
         obs = self._get_obs()
-        reward, terminated = self._compute_reward(action)
+        reward, terminated = self._compute_reward()
         truncated = self.current_step >= self.max_episode_steps
         info = {"is_success": self.current_cube_idx >= len(self.cube_names)}
         return obs, reward, terminated, truncated, info
+    
+    
+    
     def reset(self, seed=None, options=None):
         # 这个函数基本不变，只是不再需要重置IK求解器了
         super().reset(seed=seed)
@@ -287,14 +275,14 @@ class ArmPickPlaceRLEnv(gym.Env):
         
         # 重置到初始关节位置并打开夹爪
         self.robot.gripper.open()
-        # 等待几步让夹爪动作完成
-        for _ in range(5):
-            self.world.step()
+        # reset时需要step几次让场景稳定下来,这是合理的
+        for _ in range(10):
+            self.world.step(render=False)
         
         obs, info = self._get_obs(), {}
         return obs, info
-    # _get_obs, _compute_reward, close 函数可以保持完全不变
-    # ... (此处省略这些未改变的函数，直接使用您文件中的版本即可)
+
+
     def _get_obs(self):
         obs_dict = self.task.get_observations()
         ee_pos, _ = self.robot.end_effector.get_world_pose()
@@ -308,43 +296,86 @@ class ArmPickPlaceRLEnv(gym.Env):
             cube_pos, color_idx, target_pos = np.zeros(3), 0, np.zeros(3)
         relative_vec = (cube_pos - ee_pos) if not self.has_grasped else (target_pos - cube_pos)
         distance = np.linalg.norm(relative_vec)
-        gripper_state = np.array([1.0 if self.has_grasped else 0.0])
+        
+        
+        self.IsGripperClose = np.array([1.0 if self.has_grasped else 0.0])
+        
+
+        target_pos = obs_dict["target_positions"][color_idx]
+        
         return np.concatenate([
-            ee_pos.astype(np.float32), joint_pos.astype(np.float32), relative_vec.astype(np.float32),
-            np.array([distance], dtype=np.float32), cube_pos.astype(np.float32),
-            target_pos.astype(np.float32), gripper_state
+            joint_pos[:7].astype(np.float32),
+            ee_pos.astype(np.float32), cube_pos.astype(np.float32) ,target_pos.astype(np.float32),
+            np.array([distance], dtype=np.float32), self.IsGripperClose.astype(np.float32)
         ])
-    def _compute_reward(self, action: np.ndarray):
+        
+        
+        
+        
+    def place(self):
+        """标记放置状态,但不在这里step"""
+        self.current_cube_idx += 1
+        self.has_grasped = False
+        self.robot.gripper.open()
+            
+    def grasp(self):
+        """标记抓取状态,但不在这里step"""
+        self.has_grasped = True
+        self.robot.gripper.close()
+
+        
+    def _compute_reward(self):
         reward = 0.0
         obs_dict = self.task.get_observations()
         ee_pos, _ = self.robot.end_effector.get_world_pose()
-        if self.current_cube_idx >= len(self.cube_names): return 500.0, True
+        
+        # (这个检查主要是为了处理edge case,正常应该在place()后就终止了)
+        if self.current_cube_idx >= len(self.cube_names):
+            return 50.0, True
+            
         cube_name = self.cube_names[self.current_cube_idx]
         cube_pos, color_idx = obs_dict[cube_name]["position"], obs_dict[cube_name]["color_idx"]
-        target_pos = obs_dict["target_positions"][color_idx]
-        dist_ee_to_cube = np.linalg.norm(ee_pos - cube_pos)
-        dist_cube_to_target = np.linalg.norm(cube_pos - target_pos)
+
+
         if not self.has_grasped:
-            if self.last_distance_to_cube is not None: reward += (self.last_distance_to_cube - dist_ee_to_cube) * 10.0
-            if dist_ee_to_cube < 0.05:
-                reward += 10.0
-                if action[7] > 0.5: # 夹爪动作在索引7
-                    reward += 10.0
-                    if cube_pos[2] > 0.03: self.has_grasped = True; reward += 200.0
+            target_pos = cube_pos
         else:
-            if self.last_distance_to_target is not None: reward += (self.last_distance_to_target - dist_cube_to_target) * 15.0
-            if dist_cube_to_target < 0.05:
-                reward += 50.0
-                if action[7] < -0.5: # 夹爪动作在索引7
-                    reward += 30.0
-                    if cube_pos[2] < 0.05:
-                        reward += 250.0; self.has_grasped = False; self.current_cube_idx += 1
-                        if self.current_cube_idx >= len(self.cube_names): return reward + 500.0, True
-        self.last_distance_to_cube = dist_ee_to_cube
-        if self.has_grasped: self.last_distance_to_target = dist_cube_to_target
-        if ee_pos[2] > 0.8: reward -= 5.0
-        elif ee_pos[2] < 0.0: reward -= 10.0
+            target_pos = obs_dict["target_positions"][color_idx]
+            
+        distance = np.linalg.norm(target_pos - ee_pos)
+        
+        # 基础距离奖励: 总是给,引导agent接近目标
+        distance_reward = 2.0 * np.exp(-8.0 * distance)
+        reward += distance_reward
+        
+        # 📊 每100步打印一次当前状态
+        if self.current_step % 100 == 0:
+            print(f"[Step {self.current_step}] cube_idx={self.current_cube_idx}/{len(self.cube_names)}, has_grasped={self.has_grasped} , distance={distance:.4f}m, reward={distance_reward:.4f}")
+        
+        # 到达目标点的里程碑奖励
+        threshold = 0.05  # 🎯 放宽到8cm,让agent更容易触发成功!
+        if distance < threshold:
+            if not self.has_grasped:
+                self.grasp()
+                reward += 50.0  # 成功抓取
+                print(f"✅ [Step {self.current_step}] 成功抓取方块 {self.current_cube_idx}, distance={distance:.4f}")
+            else:
+                self.place()
+                reward += 50.0  # 成功放置
+                print(f"✅ [Step {self.current_step}] 成功放置方块 {self.current_cube_idx}, distance={distance:.4f}")
+                
+                
+                if self.current_cube_idx >= len(self.cube_names):                    
+                    # 🎯 速度奖励: 剩余时间越多,奖励越高
+                    remaining_steps = self.max_episode_steps - self.current_step
+                    speed_bonus = remaining_steps * 2.0  # 每剩余1步奖励2分
+                    reward += speed_bonus
+                    
+                    return reward, True  # 立即终止episode
+
         return reward, False
+    
+    
     def close(self):
         if self._owns_simulation_app and hasattr(self, 'simulation_app'):
             self.simulation_app.close()

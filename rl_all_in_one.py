@@ -77,7 +77,7 @@ def train_model(args):
         return Monitor(env)
     
     env = DummyVecEnv([make_env])
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    env = VecNormalize(env)
     
     # 创建保存目录
     os.makedirs("./models", exist_ok=True)
@@ -96,9 +96,9 @@ def train_model(args):
             "MlpPolicy",
             env,
             learning_rate=3e-4,
-            n_steps=1024,  # 从2048减少到1024（更快收集样本）
-            batch_size=128,  # 从64增加到128（提高GPU利用率）
-            n_epochs=10,  # 从10减少到5（减少训练时间）
+            n_steps=2048,  
+            batch_size=128,  
+            n_epochs=10,  
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
@@ -106,24 +106,8 @@ def train_model(args):
             verbose=1,
             tensorboard_log="./logs/",
             policy_kwargs=dict(
-                net_arch=[dict(pi=[256, 256], vf=[128, 128])]  # 从256减小到128（更快）
+                net_arch=[dict(pi=[256, 256], vf=[128, 128])]  #
             )
-        )
-    elif args.algorithm == "sac":
-        model = SAC(
-            "MlpPolicy",
-            env,
-            learning_rate=3e-4,
-            buffer_size=100000,
-            learning_starts=1000,
-            batch_size=256,
-            tau=0.005,
-            gamma=0.99,
-            train_freq=1,
-            gradient_steps=1,
-            ent_coef="auto",
-            verbose=1,
-            tensorboard_log="./logs/",
         )
     else:
         raise ValueError(f"不支持的算法: {args.algorithm}")
@@ -178,7 +162,7 @@ def test_model(args):
     
     # 创建环境
     env = ArmPickPlaceRLEnv(
-        render_mode='human',
+        render_mode="human",
         headless=args.headless, 
         cube_num=args.cube_num,
         simulation_app=simulation_app
