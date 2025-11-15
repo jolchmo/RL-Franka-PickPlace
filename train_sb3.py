@@ -3,6 +3,12 @@
 # 使用Isaac Lab + Stable-Baselines3 训练Franka抓取任务
 
 """
+推荐配置:
+- 低显存 (8GB):   --num_envs 2048
+- 中等显存 (16GB): --num_envs 4096
+- 高显存 (24GB):   --num_envs 8192
+- 超高显存 (48GB): --num_envs 16384
+
 使用方法:
 # 训练（2048个并行环境）
 python train_sb3.py --num_envs 2048 --headless --timesteps 10000000
@@ -220,12 +226,52 @@ def train():
     
     # 创建环境
     print(f"📦 创建 {args_cli.num_envs} 个并行环境...")
+    print(f"🔧 配置确认: env_cfg.scene.num_envs = {env_cfg.scene.num_envs}")
+    
+    # 检查GPU显存
+    if torch.cuda.is_available():
+        gpu_props = torch.cuda.get_device_properties(0)
+        total_mem_gb = gpu_props.total_memory / 1024**3
+        print(f"🎮 GPU: {gpu_props.name}")
+        print(f"💾 总显存: {total_mem_gb:.2f} GB")
+        allocated_gb = torch.cuda.memory_allocated(0) / 1024**3
+        print(f"📊 已分配: {allocated_gb:.2f} GB")
+    
     base_env = FrankaPickPlaceEnv(cfg=env_cfg)
+    
+    # 检查环境创建后的显存
+    if torch.cuda.is_available():
+        allocated_gb = torch.cuda.memory_allocated(0) / 1024**3
+        reserved_gb = torch.cuda.memory_reserved(0) / 1024**3
+        print(f"💾 环境创建后显存: 分配={allocated_gb:.2f}GB, 保留={reserved_gb:.2f}GB")
+    
+    print(f"✅ 实际创建的环境数: {base_env.num_envs}")
+    
+    # 检查环境数是否匹配
+    if base_env.num_envs != args_cli.num_envs:
+        print("\n" + "="*70)
+        print("⚠️  警告: 环境数不匹配!")
+        print(f"   请求环境数: {args_cli.num_envs}")
+        print(f"   实际环境数: {base_env.num_envs}")
+        print(f"   差异: {args_cli.num_envs - base_env.num_envs} 个环境未创建")
+        print("\n   可能原因:")
+        print("   1. Isaac Lab 内部有最大环境数限制")
+        print("   2. 配置文件的默认值覆盖了命令行参数")
+        print("   3. 显存不足，系统自动降级")
+        print("="*70 + "\n")
+        
+        user_input = input("是否继续训练? (y/n): ")
+        if user_input.lower() != 'y':
+            print("训练已取消")
+            return
+    else:
+        print(f"✅ 环境数匹配! 成功创建了所有 {base_env.num_envs} 个环境\n")
+    
     env = IsaacLabVecEnvWrapper(base_env)
     
     print(f"🔍 观察空间: {env.observation_space}")
     print(f"🔍 动作空间: {env.action_space}")
-    print(f"🔍 并行环境数: {env.num_envs}")
+    print(f"🔍 最终并行环境数: {env.num_envs}")
     
     # 准备输出目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -236,7 +282,7 @@ def train():
     
     # 配置回调
     checkpoint_callback = CheckpointCallback(
-        save_freq=50000 // args_cli.num_envs,  # 每50k步保存一次
+        save_freq=1000000 // args_cli.num_envs,  # 每1000k步保存一次
         save_path=model_dir,
         name_prefix="franka_pickplace",
         save_replay_buffer=False,
@@ -258,19 +304,36 @@ def train():
         )
     else:
         print("🆕 创建新模型")
+        # 根据环境数动态调整batch_size
+        num_envs = args_cli.num_envs
+        # batch_size应该是num_envs的倍数，且足够大以充分利用GPU
+        if num_envs >= 8192:
+            batch_size = 8192
+            n_steps = 16
+        elif num_envs >= 4096:
+            batch_size = 4096
+            n_steps = 32
+        else:
+            batch_size = 2048
+            n_steps = 32
+        
+        print(f"📊 训练配置: num_envs={num_envs}, n_steps={n_steps}, batch_size={batch_size}")
+        print(f"   每次更新收集: {num_envs * n_steps} 步")
+        print(f"   每次更新梯度步数: {(num_envs * n_steps) // batch_size * 10} 步")
+        
         model = PPO(
             "MlpPolicy",
             env,
             learning_rate=3e-4,
-            n_steps=16,  # 每个环境收集16步后更新
-            batch_size=2048,  # 2048个样本的minibatch
-            n_epochs=8,  # 每次更新训练8个epoch
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=10,  # 每次更新训练10个epoch
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.0,
-            vf_coef=4.0,
-            max_grad_norm=1.0,
+            ent_coef=0.01,  # 鼓励探索
+            vf_coef=0.5,  # 价值函数损失权重
+            max_grad_norm=0.5,  # 梯度裁剪
             verbose=1,
             tensorboard_log=log_dir,
             device="cuda" if torch.cuda.is_available() else "cpu",
@@ -289,6 +352,11 @@ def train():
     print(f"📊 日志保存到: {log_dir}")
     print(f"📈 TensorBoard: tensorboard --logdir={log_dir}")
     print("=" * 60)
+    
+    # 显示训练开始前的显存
+    if torch.cuda.is_available():
+        print(f"\n💾 训练前显存: {torch.cuda.memory_reserved(0) / 1024**3:.2f}GB")
+        print("⏳ 训练开始后显存会增长，请用 nvidia-smi 监控\n")
     
     # 开始训练
     model.learn(
