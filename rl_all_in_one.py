@@ -76,8 +76,31 @@ def train_model(args):
         )
         return Monitor(env)
     
-    env = DummyVecEnv([make_env])
-    env = VecNormalize(env)
+    dummy_env = DummyVecEnv([make_env])
+    vecnorm_path_guess = None
+    if args.resume_from:
+        if args.resume_vecnormalize:
+            vecnorm_path_guess = args.resume_vecnormalize
+        else:
+            base_name = os.path.splitext(args.resume_from)[0]
+            # 兼容默认保存路径: ./models/vec_normalize_{algorithm}.pkl
+            candidate = base_name + "_vecnormalize.pkl"
+            if os.path.exists(candidate):
+                vecnorm_path_guess = candidate
+            else:
+                default_vec = f"./models/vec_normalize_{args.algorithm}.pkl"
+                if os.path.exists(default_vec):
+                    vecnorm_path_guess = default_vec
+
+    if vecnorm_path_guess and os.path.exists(vecnorm_path_guess):
+        print(f"加载 VecNormalize 状态: {vecnorm_path_guess}")
+        env = VecNormalize.load(vecnorm_path_guess, dummy_env)
+        env.training = True
+        env.norm_reward = True
+    else:
+        if args.resume_from and not vecnorm_path_guess:
+            print("⚠️ 未找到匹配的 VecNormalize 文件, 将重新初始化归一化统计。")
+        env = VecNormalize(dummy_env)
     
     # 创建保存目录
     os.makedirs("./models", exist_ok=True)
@@ -91,13 +114,21 @@ def train_model(args):
     )
     
     # 创建模型（优化训练速度）
-    if args.algorithm == "ppo":
+    if args.algorithm != "ppo":
+        raise ValueError(f"不支持的算法: {args.algorithm}")
+
+    if args.resume_from:
+        if not os.path.exists(args.resume_from):
+            raise FileNotFoundError(f"无法找到指定的 checkpoint: {args.resume_from}")
+        print(f"加载已有模型继续训练: {args.resume_from}")
+        model = PPO.load(args.resume_from, env=env)
+    else:
         model = PPO(
             "MlpPolicy",
             env,
             learning_rate=3e-4,
-            n_steps=2048,  
-            batch_size=128,  
+            n_steps=4096,  
+            batch_size=256,  
             n_epochs=10,  
             gamma=0.99,
             gae_lambda=0.95,
@@ -106,11 +137,9 @@ def train_model(args):
             verbose=1,
             tensorboard_log="./logs/",
             policy_kwargs=dict(
-                net_arch=[dict(pi=[256, 256], vf=[128, 128])]  #
+                net_arch=[dict(pi=[256, 256], vf=[256, 256])]  #
             )
         )
-    else:
-        raise ValueError(f"不支持的算法: {args.algorithm}")
     
     print("\n开始训练...")
     print("提示: 使用 'tensorboard --logdir ./logs/' 查看训练进度")
@@ -120,7 +149,8 @@ def train_model(args):
     model.learn(
         total_timesteps=args.timesteps,
         callback=checkpoint_callback,
-        progress_bar=True
+        progress_bar=True,
+        reset_num_timesteps=not bool(args.resume_from)
     )
     
     # 保存最终模型
@@ -194,9 +224,10 @@ def test_model(args):
     success_count = 0
     
     for episode in range(args.episodes):
-        obs, info = env.reset()
         if vec_env:
-            obs = vec_env.normalize_obs(obs)
+            obs = vec_env.reset()
+        else:
+            obs, info = env.reset()
         
         episode_reward = 0
         episode_length = 0
@@ -209,11 +240,11 @@ def test_model(args):
             action, _ = model.predict(obs, deterministic=True)
             
             # 执行动作
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            
             if vec_env:
-                obs = vec_env.normalize_obs(obs)
+                obs, reward, done, info = vec_env.step(action)
+            else:
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
             
             episode_reward += reward
             episode_length += 1
@@ -224,7 +255,6 @@ def test_model(args):
         episode_lengths.append(episode_length)
         
         
-        print(f"  奖励: {episode_reward:.2f}, 步数: {episode_length}")
     
     # 打印总结
     print("\n" + "=" * 60)
@@ -402,6 +432,10 @@ def main():
                              help='方块数量')
     train_parser.add_argument('--headless', action='store_true', 
                              help='无头模式')
+    train_parser.add_argument('--resume-from', type=str, default=None,
+                             help='已有模型checkpoint路径,用于继续训练')
+    train_parser.add_argument('--resume-vecnormalize', type=str, default=None,
+                             help='VecNormalize状态文件路径,未提供则尝试自动推断')
     
     # 测试模式参数
     test_parser = subparsers.add_parser('test', help='测试模式')

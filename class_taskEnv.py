@@ -187,7 +187,7 @@ class ArmPickPlaceRLEnv(gym.Env):
     这种方式更底层、更直接，但对 Agent 的学习能力要求更高。
     """
     metadata = {"render_modes": ["human", "rgb_array"]}
-    def __init__(self, headless=False, render_mode=None, max_episode_steps=1200   , cube_num=8, simulation_app=None):
+    def __init__(self, headless=False, render_mode=None, max_episode_steps=100   , cube_num=8, simulation_app=None):
         if not GYMNASIUM_AVAILABLE:
             raise ImportError("gymnasium is required. Please run: pip install gymnasium")
         super().__init__()
@@ -217,13 +217,14 @@ class ArmPickPlaceRLEnv(gym.Env):
         num_arm_joints = 7
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(num_arm_joints,), dtype=np.float32)
         
-        # 观测空间保持不变，因为它已经包含了关节位置和任务所需信息
+        # 观测空间: 7关节 + EE位置3 + cube位置3 + 相对向量3 + 距离1 + 夹爪状态1 = 18
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(18,), dtype=np.float32)
         # 任务相关的逻辑状态变量
         self.current_step = 0
         self.cube_names = []
         self.current_cube_idx = 0
         self.has_grasped = False
+        self.reach_waypoint = False
         self.last_distance_to_cube = None
         self.last_distance_to_target = None
     def step(self, action: np.ndarray):
@@ -237,7 +238,7 @@ class ArmPickPlaceRLEnv(gym.Env):
         
         joint_actions = action[:7]
 
-        action_scale = 0.4
+        action_scale = 0.5  # 增大到0.5弧度(约28度)，让动作更流畅
         
         # 获取当前所有关节的位置（Franka有9个自由度：7臂+2指）
         current_joint_positions = self.robot.get_joint_positions()
@@ -270,7 +271,7 @@ class ArmPickPlaceRLEnv(gym.Env):
         self.task.reset()
         self.current_step = 0
         self.cube_names = self.task.get_cube_names()
-        self.current_cube_idx, self.has_grasped = 0, False
+        self.current_cube_idx, self.has_grasped ,self.reach_waypoint = 0, False ,False
         self.last_distance_to_cube, self.last_distance_to_target = None, None
         
         # 重置到初始关节位置并打开夹爪
@@ -316,6 +317,7 @@ class ArmPickPlaceRLEnv(gym.Env):
         """标记放置状态,但不在这里step"""
         self.current_cube_idx += 1
         self.has_grasped = False
+        self.reach_waypoint = False
         self.robot.gripper.open()
             
     def grasp(self):
@@ -337,41 +339,55 @@ class ArmPickPlaceRLEnv(gym.Env):
         cube_pos, color_idx = obs_dict[cube_name]["position"], obs_dict[cube_name]["color_idx"]
 
 
+
         if not self.has_grasped:
-            target_pos = cube_pos
+            # 抓取阶段：看末端到方块的距离
+            distance = np.linalg.norm(cube_pos - ee_pos)
+            distance_reward = 0.5 * np.exp(-10.0 * distance)
+            reward += distance_reward
+        elif not self.reach_waypoint:
+            # 搬运阶段的中间点奖励：看方块到中间点的距离
+            waypoint = (obs_dict["target_positions"][color_idx] + cube_pos) / 2.0 + np.array([0,0,0.05])
+            distance = np.linalg.norm(cube_pos - waypoint)
+            distance_reward = 0.5 * np.exp(-8.0 * distance)
+            reward += distance_reward
         else:
-            target_pos = obs_dict["target_positions"][color_idx]
-            
-        distance = np.linalg.norm(target_pos - ee_pos)
-        
-        # 基础距离奖励: 总是给,引导agent接近目标
-        distance_reward = 2.0 * np.exp(-8.0 * distance)
-        reward += distance_reward
+            # 搬运阶段：看方块到目标的距离（防止推方块）
+            distance = np.linalg.norm(cube_pos - obs_dict["target_positions"][color_idx])
+            distance_reward = 0.5 * np.exp(-8.0 * distance)
+            reward += distance_reward
+
         
         # 📊 每100步打印一次当前状态
         if self.current_step % 100 == 0:
             print(f"[Step {self.current_step}] cube_idx={self.current_cube_idx}/{len(self.cube_names)}, has_grasped={self.has_grasped} , distance={distance:.4f}m, reward={distance_reward:.4f}")
         
+        
         # 到达目标点的里程碑奖励
-        threshold = 0.05  # 🎯 放宽到8cm,让agent更容易触发成功!
+        threshold = 0.01  # 🎯 放宽到8cm,让agent更容易触发成功!
         if distance < threshold:
-            if not self.has_grasped:
-                self.grasp()
-                reward += 50.0  # 成功抓取
-                print(f"✅ [Step {self.current_step}] 成功抓取方块 {self.current_cube_idx}, distance={distance:.4f}")
-            else:
-                self.place()
-                reward += 50.0  # 成功放置
-                print(f"✅ [Step {self.current_step}] 成功放置方块 {self.current_cube_idx}, distance={distance:.4f}")
+            return 10, True
+            # if not self.has_grasped:
+            #     self.grasp()
+            #     reward += 50.0  # 成功抓取
+            #     print(f"✅ [Step {self.current_step}] 成功抓取方块 {self.current_cube_idx}, distance={distance:.4f}")
+            # elif not self.reach_waypoint:
+            #     self.reach_waypoint = True
+            #     reward += 20.0  # 成功到达中间点
+            #     print(f"✅ [Step {self.current_step}] 成功到达中间点 for 方块 {self.current_cube_idx}, distance={distance:.4f}")
+            # else:
+            #     self.place()
+            #     reward += 50.0  # 成功放置
+            #     print(f"✅ [Step {self.current_step}] 成功放置方块 {self.current_cube_idx}, distance={distance:.4f}")
                 
                 
-                if self.current_cube_idx >= len(self.cube_names):                    
-                    # 🎯 速度奖励: 剩余时间越多,奖励越高
-                    remaining_steps = self.max_episode_steps - self.current_step
-                    speed_bonus = remaining_steps * 2.0  # 每剩余1步奖励2分
-                    reward += speed_bonus
+            #     if self.current_cube_idx >= len(self.cube_names):                    
+            #         # 🎯 速度奖励: 剩余时间越多,奖励越高
+            #         remaining_steps = self.max_episode_steps - self.current_step
+            #         speed_bonus = remaining_steps * 2.0  # 每剩余1步奖励2分
+            #         reward += speed_bonus
                     
-                    return reward, True  # 立即终止episode
+            #         return reward, True  # 立即终止episode
 
         return reward, False
     

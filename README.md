@@ -18,44 +18,30 @@
 C:\issac-sim\python.bat rl_all_in_one.py train --algorithm ppo --timesteps 100000
 ```
 
+```
+C:\issac-sim\python.bat rl_all_in_one.py train `
+  --algorithm ppo `
+  --timesteps 200000 `
+  --cube-num 2 `
+  --headless `
+  --resume-from models/ppo_armpickplace_final.zip `
+  --resume-vecnormalize models/vec_normalize_ppo.pkl
+```
+ 
+
 **参数说明:**
 - `--algorithm`: 算法类型 (`ppo` 或 `sac`)
 - `--timesteps`: 训练步数 (默认: 100000)
 - `--cube-num`: 方块数量 (默认: 6)
 - `--headless`: 无头模式运行 (不显示GUI，训练更快)
 
-**示例:**
-
-```powershell
-# 快速训练（5万步，无头模式）
-python rl_all_in_one.py train --algorithm ppo --timesteps 50000 --headless
-
-# 复杂任务（10个方块，20万步）
-C:\issac-sim\python.bat rl_all_in_one.py train --algorithm ppo --timesteps 100000 --headless --cube-num 1
-
-# 使用SAC算法
-C:\issac-sim\python.bat rl_all_in_one.py train --algorithm ppo --timesteps 100000 --headless
-```
-
-**训练后文件:**
-- `./models/ppo_armpickplace_final.zip` - 训练好的模型
-- `./models/vec_normalize_ppo.pkl` - 标准化统计信息
-- `./logs/` - TensorBoard日志
-
-**查看训练进度:**
-```powershell
-tensorboard --logdir ./logs/
-# 打开浏览器访问 http://localhost:6006
-```
-
----
 
 ### 2️⃣ 测试模式
 
 测试训练好的模型性能：
 
 ```powershell
-C:\issac-sim\python.bat rl_all_in_one.py test --model .\models\ppo_armpickplace_final.zip --episodes 5
+C:\issac-sim\python.bat rl_all_in_one.py test --model .\models\ppo_armpickplace_final.zip --episodes 5 --cube-num 1
 ```
 
 **参数说明:**
