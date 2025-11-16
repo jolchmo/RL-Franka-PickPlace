@@ -54,8 +54,76 @@ from franka_pickplace_env_cfg import FrankaPickPlaceEnvCfg
 
 
 # =================================================================
-# 自定义回调：记录详细训练信息
+# 自定义回调 - 显示详细奖励信息
 # =================================================================
+class DetailedRewardCallback(BaseCallback):
+    """
+    自定义回调：显示详细的奖励统计，包括每个奖励分量
+    """
+    def __init__(self, check_freq=1, verbose=0):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+        self.rollout_count = 0
+    
+    def _on_step(self) -> bool:
+        """每步调用一次，必须实现"""
+        return True
+        
+    def _on_rollout_end(self) -> None:
+        """在每个rollout结束时打印详细统计"""
+        self.rollout_count += 1
+        
+        # 只在指定频率打印
+        if self.rollout_count % self.check_freq != 0:
+            return
+            
+        # 获取基础环境
+        base_env = self.training_env.envs[0].env if hasattr(self.training_env, 'envs') else self.training_env.env
+        
+        # 获取奖励管理器的统计信息
+        if hasattr(base_env, 'reward_manager'):
+            reward_manager = base_env.reward_manager
+            
+            print("\n" + "=" * 80)
+            print(f"📊 Rollout #{self.rollout_count} 奖励详情 (总步数: {self.num_timesteps:,})")
+            print("=" * 80)
+            
+            # 显示各个奖励分量的统计
+            if hasattr(reward_manager, '_term_names') and hasattr(reward_manager, '_term_cfgs'):
+                print("\n各奖励分量统计:")
+                print("-" * 80)
+                
+                # 获取最近的奖励值
+                for idx, term_name in enumerate(reward_manager._term_names):
+                    # _term_cfgs 是列表，使用索引访问
+                    cfg = reward_manager._term_cfgs[idx]
+                    weight = cfg.weight
+                    
+                    # 尝试获取该奖励项的统计信息
+                    if hasattr(reward_manager, '_episode_sums') and term_name in reward_manager._episode_sums:
+                        term_sum = reward_manager._episode_sums[term_name]
+                        print(f"  {term_name:20s}: 权重={weight:6.1f}, 累计={term_sum.mean().item():+.4f}")
+                
+            # 显示SB3的episode统计
+            if len(self.model.ep_info_buffer) > 0:
+                ep_rewards = [info['r'] for info in self.model.ep_info_buffer]
+                ep_lengths = [info['l'] for info in self.model.ep_info_buffer]
+                
+                print("\n" + "-" * 80)
+                print(f"完成的episodes: {len(ep_rewards)}")
+                print(f"平均episode奖励: {np.mean(ep_rewards):+.4f} ± {np.std(ep_rewards):.4f}")
+                print(f"最小/最大奖励: {np.min(ep_rewards):+.4f} / {np.max(ep_rewards):+.4f}")
+                print(f"平均episode长度: {np.mean(ep_lengths):.1f} 步")
+                
+                if len(ep_rewards) >= 10:
+                    recent = ep_rewards[-10:]
+                    print(f"最近10个episodes: {np.mean(recent):+.4f} ± {np.std(recent):.4f}")
+            
+            print("=" * 80 + "\n")
+        
+        return True
+
+
 class DetailedLoggingCallback(BaseCallback):
     """记录每个rollout的平均奖励和其他统计信息"""
     
@@ -282,17 +350,18 @@ def train():
     
     # 配置回调
     checkpoint_callback = CheckpointCallback(
-        save_freq=1000000 // args_cli.num_envs,  # 每1000k步保存一次
+        save_freq=10000000 // args_cli.num_envs,  # 每1kw步保存一次
         save_path=model_dir,
         name_prefix="franka_pickplace",
         save_replay_buffer=False,
         save_vecnormalize=False,
     )
     
-    logging_callback = DetailedLoggingCallback(verbose=1)
+    # 添加详细奖励日志回调
+    reward_callback = DetailedRewardCallback(check_freq=1, verbose=1)
     
     from stable_baselines3.common.callbacks import CallbackList
-    callbacks = CallbackList([checkpoint_callback, logging_callback])
+    callbacks = CallbackList([checkpoint_callback, reward_callback])
     
     # 创建或加载模型
     if args_cli.checkpoint and os.path.exists(args_cli.checkpoint):

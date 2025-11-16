@@ -46,10 +46,15 @@ class FrankaPickPlaceEnv(ManagerBasedRLEnv):
         self.cube_is_grasped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.task_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # 新增：用于里程碑奖励的事件追踪
+        self.just_grasped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.just_placed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # 新增：尝试抓取状态（用于奖励塑造）
+        self.is_attempting_grasp = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # 目标位置
         self.target_pos = torch.tensor(self.cfg.target_position, dtype=torch.float32, device=self.device).repeat(self.num_envs, 1)
-        
-
 
         # 缓存的物理状态，避免在单步内重复访问sim数据
         self.ee_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
@@ -70,6 +75,10 @@ class FrankaPickPlaceEnv(ManagerBasedRLEnv):
         # 调用父类的方法（如果存在）
         # super()._update_buffers(dt) # 如果父类有此方法
 
+        # 0. 缓存上一步的状态（在所有更新之前）
+        prev_cube_is_grasped = self.cube_is_grasped.clone()
+        prev_task_success = self.task_success.clone()
+
         # 1. 更新缓存的物理状态
         self.ee_pos_w = self.robot.data.body_pos_w[:, self.ee_body_idx]
         self.cube_pos_w = self.cube.data.root_pos_w
@@ -77,8 +86,16 @@ class FrankaPickPlaceEnv(ManagerBasedRLEnv):
         self.cube_to_target_dist = torch.norm(self.target_pos - self.cube_pos_w, dim=-1)
 
         # 2. 更新抓取状态 (grasp state)
-        # 提取夹爪动作
-        gripper_action = self.actions[:, self.cfg.arm_joint_ids[-1] + 1] # 假设夹爪是第8个动作
+        # 提取夹爪动作（第8个动作，索引7）
+        gripper_action = self.actions[:, 7]
+        
+        # 新增：更新“尝试抓取”状态（用于奖励塑造）
+        # 条件：靠近方块 + 夹爪命令为闭合 + 当前还未抓取
+        self.is_attempting_grasp = (
+            (self.ee_to_cube_dist < self.cfg.grasp_distance_threshold) &
+            (gripper_action > 0) &
+            ~self.cube_is_grasped
+        )
         
         # 条件：何时触发抓取
         # - 夹爪正在尝试闭合 (gripper_action > 0)
@@ -113,33 +130,57 @@ class FrankaPickPlaceEnv(ManagerBasedRLEnv):
         # 成功条件：抓着方块并且非常接近目标位置
         self.task_success = (self.cube_to_target_dist < self.cfg.target_success_threshold) & self.cube_is_grasped
 
+        # 4. 计算里程碑事件（用于奖励）
+        # just_grasped: 从未抓取变为已抓取
+        self.just_grasped = ~prev_cube_is_grasped & self.cube_is_grasped
+        # just_placed: 从未成功变为成功
+        self.just_placed = ~prev_task_success & self.task_success
+        
+        # 调试输出：打印关键事件（每500步打印一次）
+        if hasattr(self, '_debug_step_count') and self._debug_step_count % 500 == 0:
+            print(f"[Debug] Step {self._debug_step_count} Stats:")
+            print(f"  - Attempting grasp: {self.is_attempting_grasp.sum().item()}/{self.num_envs} envs")
+            print(f"  - Grasped cubes: {self.cube_is_grasped.sum().item()}/{self.num_envs} envs")
+            print(f"  - Just grasped: {self.just_grasped.sum().item()} envs this step")
+            print(f"  - Avg distance to cube: {self.ee_to_cube_dist.mean().item():.4f}m")
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """在物理步进前应用动作并处理运动学。"""
-        # 缓存动作
-        self.actions = actions.clone()
-
-        # --- 1. 应用机器人动作 ---
-        # 分离手臂和夹爪的动作
-        arm_actions = self.actions[:, self.cfg.arm_joint_ids]
-        gripper_action = self.actions[:, self.cfg.arm_joint_ids[-1] + 1]
-
-        # 缩放手臂动作
-        scaled_arm_actions = arm_actions * self.cfg.action_scale_internal
-
-        # 获取当前关节位置
-        current_joint_pos = self.robot.data.joint_pos[:, self.cfg.arm_joint_ids]
+        """在物理步进前应用动作并处理运动学。
         
-        # 计算目标关节位置
-        target_joint_pos = current_joint_pos + scaled_arm_actions
+        注意：由于ActionManager配置了9个关节（7臂+2指），它会自动应用前7个动作到手臂关节。
+        这里我们额外提取夹爪控制信号（action[7]或action[8]）来判断抓取意图。
+        """
+        # 缓存动作（注意：actions可能是9维的，由ActionManager处理）
+        # 我们只关心前8维：7个手臂增量 + 1个夹爪信号
+        if actions.shape[1] >= 8:
+            self.actions = actions[:, :8].clone()
+        else:
+            # 兼容性：如果只有7维，填充0
+            self.actions = torch.zeros(self.num_envs, 8, device=self.device)
+            self.actions[:, :actions.shape[1]] = actions
         
-        # 应用到机器人手臂
-        self.robot.set_joint_position_target(target_joint_pos, joint_ids=self.cfg.arm_joint_ids)
+        # 调试输出：打印第一个环境的夹爪动作值（每100步打印一次）
+        if not hasattr(self, '_debug_step_count'):
+            self._debug_step_count = 0
+        self._debug_step_count += 1
+        
+        if self._debug_step_count % 100 == 0 and self.num_envs > 0:
+            gripper_val = self.actions[0, 7].item()
+            print(f"[Debug] Step {self._debug_step_count}: Gripper Action (Env 0) = {gripper_val:.4f}")
+
+        # --- 1. 应用机器人动作（ActionManager已处理手臂关节） ---
+        # 我们只需要手动处理夹爪的开合逻辑
+        
+        # 提取夹爪控制信号（第8个动作，索引7）
+        gripper_action = self.actions[:, 7]
 
         # 应用夹爪动作 (二元开合)
+        # gripper_action > 0 表示想要闭合（抓取）
+        # gripper_action <= 0 表示想要打开（释放）
         gripper_target_pos = torch.where(
             gripper_action.unsqueeze(-1) > 0, 
-            torch.full_like(self.robot.data.joint_pos[:, self.cfg.gripper_joint_ids], self.cfg.gripper_closed_pos), # 闭合
-            torch.full_like(self.robot.data.joint_pos[:, self.cfg.gripper_joint_ids], self.cfg.gripper_open_pos)  # 打开
+            torch.full((self.num_envs, 2), self.cfg.gripper_closed_pos, device=self.device),  # 闭合
+            torch.full((self.num_envs, 2), self.cfg.gripper_open_pos, device=self.device)     # 打开
         )
         self.robot.set_joint_position_target(gripper_target_pos, joint_ids=self.cfg.gripper_joint_ids)
 
@@ -223,6 +264,13 @@ class FrankaPickPlaceEnv(ManagerBasedRLEnv):
         
         self.cube.write_root_pose_to_sim(cube_pose, env_ids=env_ids)
         self.cube.write_root_velocity_to_sim(torch.zeros_like(cube_pose[:, :6]), env_ids=env_ids)
+        
+        # 🔧 修复: Reset后立即更新缓冲区,确保第一步使用正确的状态
+        # 只更新被reset的环境的状态
+        self.ee_pos_w[env_ids] = self.robot.data.body_pos_w[env_ids, self.ee_body_idx]
+        self.cube_pos_w[env_ids] = self.cube.data.root_pos_w[env_ids]
+        self.ee_to_cube_dist[env_ids] = torch.norm(self.ee_pos_w[env_ids] - self.cube_pos_w[env_ids], dim=-1)
+        self.cube_to_target_dist[env_ids] = torch.norm(self.target_pos[env_ids] - self.cube_pos_w[env_ids], dim=-1)
 
     def _compute_grasp_transform(self, env_ids: torch.Tensor):
         """计算并存储从末端执行器到方块的相对变换矩阵。"""

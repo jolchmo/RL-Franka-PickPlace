@@ -117,10 +117,12 @@ class ObservationsCfg:
 
 @configclass
 class ActionsCfg:
-    """动作配置：7个关节的位置增量"""
+    """动作配置：8个自由度（7个关节 + 1个夹爪）的连续控制"""
+    # 使用原始的JointPositionActionCfg但明确指定所有9个关节（7臂+2指）
+    # 让环境代码在_pre_physics_step中处理8维输入到9个关节的映射
     joint_pos: ActionTermCfg = JointPositionActionCfg(
         asset_name="robot",
-        joint_names=["panda_joint.*"],
+        joint_names=["panda_joint[1-7]", "panda_finger_joint.*"],  # 7个手臂关节 + 2个夹爪关节
         scale=0.5,
         use_default_offset=True
     )
@@ -135,7 +137,20 @@ def reward_distance_to_cube(env) -> torch.Tensor:
     # 使用 (1 - distance) 确保正奖励
     # 距离0.5m: (1-0.5)=0.5, 距离0.1m: (1-0.1)=0.9
     reward = (1.0 - torch.clamp(env.ee_to_cube_dist, 0, 1.0))
-    return reward * not_grasped
+    final_reward = reward * not_grasped
+    
+    # 🔍 调试输出 - 验证奖励计算是否被调用
+    if not hasattr(env, '_reward_call_count'):
+        env._reward_call_count = 0
+    env._reward_call_count += 1
+    if env._reward_call_count % 500 == 1:  # 第1次和每500次打印
+        print(f"\n[REWARD FUNC CALLED] distance_to_cube:")
+        print(f"  Final reward: mean={final_reward.mean().item():.4f}, min={final_reward.min().item():.4f}, max={final_reward.max().item():.4f}")
+        print(f"  Raw distance (ee_to_cube_dist): mean={env.ee_to_cube_dist.mean().item():.4f}, min={env.ee_to_cube_dist.min().item():.4f}, max={env.ee_to_cube_dist.max().item():.4f}")
+        print(f"  Clamped distance: mean={torch.clamp(env.ee_to_cube_dist, 0, 1.0).mean().item():.4f}")
+        print(f"  Reward before mask: mean={reward.mean().item():.4f}, min={reward.min().item():.4f}, max={reward.max().item():.4f}")
+        print(f"  Not grasped mask: {not_grasped.sum().item()}/{env.num_envs} envs")
+    return final_reward
 
 def reward_distance_to_target(env) -> torch.Tensor:
     """搬运到目标奖励 - 简化版"""
@@ -145,45 +160,61 @@ def reward_distance_to_target(env) -> torch.Tensor:
     reward = (1.0 - torch.clamp(env.cube_to_target_dist, 0, 1.0))
     return reward * grasped
 
-def reward_reach_cube(env) -> torch.Tensor:
-    """接近方块里程碑"""
-    if not hasattr(env, 'reach_cube_bonus'):
+def reward_attempt_grasp(env) -> torch.Tensor:
+    """尝试抓取引导奖励 - 当智能体在正确位置尝试闭合夹爪时给予奖励"""
+    if not hasattr(env, 'is_attempting_grasp'):
         return torch.zeros(env.num_envs, device=env.device)
-    return env.reach_cube_bonus
+    rewards = env.is_attempting_grasp.float()
+    
+    # 🔍 调试输出
+    if hasattr(env, '_reward_call_count') and env._reward_call_count % 500 == 1:
+        active = rewards.sum().item()
+        if active > 0:
+            print(f"[REWARD FUNC CALLED] attempt_grasp: {int(active)}/{env.num_envs} envs attempting")
+    return rewards
 
 def reward_grasp_success(env) -> torch.Tensor:
-    """抓取成功里程碑"""
-    if not hasattr(env, 'grasp_success_bonus'):
+    """抓取成功里程碑奖励 - 只在刚抓取的那一步给予"""
+    if not hasattr(env, 'just_grasped'):
         return torch.zeros(env.num_envs, device=env.device)
-    return env.grasp_success_bonus
+    rewards = env.just_grasped.float()
+    
+    # 🔍 调试输出 - 成功事件总是打印
+    success_count = rewards.sum().item()
+    if success_count > 0:
+        print(f"\n🎉 [REWARD FUNC CALLED] grasp_success: {int(success_count)} envs just grasped!\n")
+    return rewards
 
 def reward_place_success(env) -> torch.Tensor:
-    """放置成功里程碑"""
-    if not hasattr(env, 'place_success_bonus'):
+    """放置成功里程碑奖励 - 只在刚放置成功的那一步给予"""
+    if not hasattr(env, 'just_placed'):
         return torch.zeros(env.num_envs, device=env.device)
-    return env.place_success_bonus
+    return env.just_placed.float()
 
 def penalty_action(env) -> torch.Tensor:
-    """动作大小惩罚"""
+    """动作大小惩罚 - 避免过度剧烈的动作"""
     if not hasattr(env, 'actions'):
         return torch.zeros(env.num_envs, device=env.device)
-    return -torch.sum(env.actions**2, dim=-1)
+    return -torch.sum(env.actions**2, dim=-1) * 0.01  # 添加0.01系数，避免惩罚过重
 
 @configclass
 class RewardsCfg:
-    """奖励配置 - 优化版：鼓励积极探索"""
+    """奖励配置 - 增加引导奖励解决稀疏奖励问题"""
     
-    # 距离奖励 - 小权重作为引导
-    distance_to_cube = RewardTermCfg(func=reward_distance_to_cube, weight=1.0)
-    distance_to_target = RewardTermCfg(func=reward_distance_to_target, weight=2.0)
+    # 距离奖励 - 提供持续引导信号
+    distance_to_cube = RewardTermCfg(func=reward_distance_to_cube, weight=0.5)
+    distance_to_target = RewardTermCfg(func=reward_distance_to_target, weight=1.5)
     
-    # 里程碑奖励 - 主要奖励来源
-    reach_cube = RewardTermCfg(func=reward_reach_cube, weight=10.0)
-    grasp_success = RewardTermCfg(func=reward_grasp_success, weight=50.0)
-    place_success = RewardTermCfg(func=reward_place_success, weight=100.0)
+    # 新增：尝试抓取引导奖励 - 解决稀疏奖励问题的关键！
+    # 这会明确告诉智能体"在方块附近闭合夹爪是正确的"
+    attempt_grasp = RewardTermCfg(func=reward_attempt_grasp, weight=5.0)
     
-    # 动作惩罚 - 极小化以鼓励探索
-    action_penalty = RewardTermCfg(func=penalty_action, weight=1.0)  # 权重已包含在函数中
+    # 里程碑奖励 - 主要奖励来源（适当降低权重，因为现在有引导了）
+    grasp_success = RewardTermCfg(func=reward_grasp_success, weight=20.0)
+    place_success = RewardTermCfg(func=reward_place_success, weight=40.0)
+    
+    # 动作惩罚 - 鼓励平滑控制
+    action_penalty = RewardTermCfg(func=penalty_action, weight=1.0)  # 权重已在函数内部处理
 
 
 @configclass
