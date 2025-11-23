@@ -3,9 +3,12 @@
 from isaacsim import SimulationApp
 import numpy as np
 # 启动Isaac Sim
-simulation_app = SimulationApp({"headless": False})
+simulation_app = SimulationApp({
+    "headless": True,  # Set to False to see the GUI
+})
 
 from isaacsim.core.api import World
+
 my_world = World(stage_units_in_meters=1.0)
 my_world.scene.add_default_ground_plane()
 
