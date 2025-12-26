@@ -195,71 +195,36 @@ class RewardsCfg:
 
     # Stage 2: Grasping
     grasping_object = RewTerm(
-        func=mdp.grasp_reward, 
+        func=mdp.grasp_reward,
         params={"distance_threshold": 0.04},
         weight=5.0
     )
 
-    # Stage 3: Lifting
+    # Stage 3: Lifting (increased weight for better learning)
     lifting_object = RewTerm(
-        func=mdp.object_is_lifted, params={"minimal_height": 0.04}, weight=10.0
+        func=mdp.object_is_lifted, params={"minimal_height": 0.04}, weight=12.0
     )
 
-    # Stage 4: Transport (multi-scale for better gradients)
-    object_goal_tracking_coarse = RewTerm(
+    # Stage 4: Transport (combined coarse/fine for simplicity)
+    object_goal_tracking = RewTerm(
         func=mdp.object_goal_distance,
-        params={"std": 0.5, "minimal_height": 0.04, "command_name": "drop_pose"},
-        weight=8.0,
+        params={"std": 0.2, "minimal_height": 0.04, "command_name": "drop_pose"},
+        weight=10.0,
     )
 
-    object_goal_tracking_fine = RewTerm(
-        func=mdp.object_goal_distance,
-        params={"std": 0.1, "minimal_height": 0.04, "command_name": "drop_pose"},
-        weight=8.0,
-    )
-
-    # Stage 5: Placement (height-aware)
+    # Stage 5: Placement (decreased weight to avoid reward hacking)
     placement_reward = RewTerm(
         func=mdp.placement_height_reward,
         params={"xy_threshold": 0.08, "target_height_offset": 0.05, "command_name": "drop_pose"},
-        weight=15.0,
+        weight=8.0,
     )
 
-    # Stage 6: Release
+    # Stage 6: Release (decreased weight for balanced learning)
     release_reward = RewTerm(
         func=mdp.release_reward,
         params={"xy_threshold": 0.05, "height_threshold": 0.08, "command_name": "drop_pose"},
-        weight=20.0,
+        weight=10.0,
     )
-
-    # reward_reach = RewTerm(
-    #     mdp.reward_stage_reach,
-    #     weight=1.0,
-    # )
-
-    # rew_lift = RewTerm(
-    #     mdp.reward_stage_lift,
-    #     params={"min_height": 0.04},
-    #     weight=0.0,
-    # )
-
-    # rew_transport = RewTerm(
-    #     mdp.reward_stage_transport,
-    #     params={"std": 0.2,"min_height": 0.04, "command_name": "drop_pose"},
-    #     weight=0.0,
-    # )
-
-    # rew_transport_fine_grained = RewTerm(
-    #     mdp.reward_stage_transport,
-    #     params={"std": 0.05,"min_height": 0.04, "command_name": "drop_pose"},
-    #     weight=0.0,
-    # )
-
-    # rew_place = RewTerm(
-    #     mdp.reward_stage_place,
-    #     params={"distance_threshold": 0.03, "command_name": "drop_pose"},
-    #     weight=0.0,
-    # )
 
     # --- PENALTIES --- #
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
@@ -276,9 +241,9 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # object_reaching_goal = DoneTerm(
-    #     func=mdp.object_reached_goal, params={"command_name": "drop_pose"}
-    # )
+    object_reaching_goal = DoneTerm(
+        func=mdp.object_reached_goal, params={"command_name": "drop_pose", "threshold": 0.05}
+    )
 
 
 @configclass
@@ -286,14 +251,16 @@ class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
     # Gradually increase placement and release rewards as training progresses
+    # Initial weight -> Final weight: 8.0 -> 15.0
     placement_weight = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "placement_reward", "weight": 30.0, "num_steps": 15000},
+        params={"term_name": "placement_reward", "weight": 15.0, "num_steps": 15000},
     )
 
+    # Initial weight -> Final weight: 10.0 -> 20.0
     release_weight = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "release_reward", "weight": 40.0, "num_steps": 25000},
+        params={"term_name": "release_reward", "weight": 20.0, "num_steps": 25000},
     )
 
     # Gradually increase action penalties to encourage smooth motion
